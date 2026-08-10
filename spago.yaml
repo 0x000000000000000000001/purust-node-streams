@@ -36,4 +36,97 @@ package:
       - partial
       - spec
 
-workspace: {}
+workspace:
+  packageSet:
+    registry: 77.7.0
+  extraPackages:
+    aff:
+      path: "../purust-aff"
+    argonaut-core:
+      path: "../purust-argonaut-core"
+    arrays:
+      path: "../purust-arrays"
+    assert:
+      path: "../purust-assert"
+    avar:
+      path: "../purust-avar"
+    catenable-lists:
+      path: "../purust-catenable-lists"
+    console:
+      path: "../purust-console"
+    datetime:
+      path: "../purust-datetime"
+    effect:
+      path: "../purust-effect"
+    enums:
+      path: "../purust-enums"
+    exceptions:
+      path: "../purust-exceptions"
+    foldable-traversable:
+      path: "../purust-foldable-traversable"
+    foreign:
+      path: "../purust-foreign"
+    foreign-object:
+      path: "../purust-foreign-object"
+    functions:
+      path: "../purust-functions"
+    integers:
+      path: "../purust-integers"
+    js-promise:
+      path: "../purust-js-promise"
+    js-promise-aff:
+      path: "../purust-js-promise-aff"
+    js-uri:
+      path: "../purust-js-uri"
+    lazy:
+      path: "../purust-lazy"
+    node-event-emitter:
+      path: "../purust-node-event-emitter"
+    node-fs:
+      path: "../purust-node-fs"
+    node-http:
+      path: "../purust-node-http"
+    node-net:
+      path: "../purust-node-net"
+    node-path:
+      path: "../purust-node-path"
+    node-process:
+      path: "../purust-node-process"
+    now:
+      path: "../purust-now"
+    nullable:
+      path: "../purust-nullable"
+    numbers:
+      path: "../purust-numbers"
+    partial:
+      path: "../purust-partial"
+    prelude:
+      path: "../purust-prelude"
+    random:
+      path: "../purust-random"
+    record:
+      path: "../purust-record"
+    refs:
+      path: "../purust-refs"
+    run:
+      path: "../purust-run"
+    simple-json:
+      path: "../purust-simple-json"
+    spec:
+      path: "../purust-spec"
+    st:
+      path: "../purust-st"
+    strings:
+      path: "../purust-strings"
+    test:
+      path: "../purust-test"
+    unfoldable:
+      path: "../purust-unfoldable"
+    unsafe-coerce:
+      path: "../purust-unsafe-coerce"
+    uuid:
+      path: "../purust-uuid"
+    variant:
+      path: "../purust-variant"
+    yoga-json:
+      path: "../purust-yoga-json"
