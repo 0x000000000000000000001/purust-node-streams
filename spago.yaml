@@ -46,6 +46,8 @@ workspace:
       path: "../purust-argonaut-core"
     arrays:
       path: "../purust-arrays"
+    arraybuffer-types:
+      path: "../purust-arraybuffer-types"
     assert:
       path: "../purust-assert"
     avar:
