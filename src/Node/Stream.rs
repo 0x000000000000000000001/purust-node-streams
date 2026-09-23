@@ -214,10 +214,20 @@ pub fn purust_writable_bytes(stream: &Rc<EventEmitter>) -> Vec<u8> {
     state_of(stream).lock().unwrap().sink.clone()
 }
 
-fn flush(state: &mut StreamState, bytes: &[u8]) {
+/// A write hook that must run *outside* the stream-state lock: integrations
+/// (HTTP outgoing messages) resolve their own state through the stream
+/// extension, which re-locks the same mutex.
+type DeferredFlush = Option<(std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>, Vec<u8>)>;
+
+fn run_deferred_flush(deferred: DeferredFlush) {
+    if let Some((hook, bytes)) = deferred {
+        hook(&bytes);
+    }
+}
+
+fn flush(state: &mut StreamState, bytes: &[u8]) -> DeferredFlush {
     if let Some(hook) = state.write_hook.clone() {
-        hook(bytes);
-        return;
+        return Some((hook, bytes.to_vec()));
     }
     state.sink.extend_from_slice(bytes);
     if let Some(fd) = state.write_fd {
@@ -246,6 +256,7 @@ fn flush(state: &mut StreamState, bytes: &[u8]) {
             let _ = file.write_all(bytes);
         }
     }
+    None
 }
 
 fn chunk_bytes(chunk: &Chunk) -> Vec<u8> {
@@ -282,18 +293,19 @@ fn read_chunk(stream: &Rc<EventEmitter>, limit: Option<usize>) -> Option<Chunk> 
 }
 
 fn finish_writable(stream: &Rc<EventEmitter>) {
-    let should_emit = {
+    let (should_emit, deferred) = {
         let state = state_of(stream);
         let mut state = state.lock().unwrap();
         if state.finished {
-            false
+            (false, None)
         } else {
             let pending = std::mem::take(&mut state.corked_bytes);
-            flush(&mut state, &pending);
+            let deferred = flush(&mut state, &pending);
             state.finished = true;
-            !state.finish_emitted
+            (!state.finish_emitted, deferred)
         }
     };
+    run_deferred_flush(deferred);
     if should_emit {
         let hook = state_of(stream).lock().unwrap().end_hook.clone();
         state_of(stream).lock().unwrap().finish_emitted = true;
@@ -315,11 +327,12 @@ pub fn purust_stream_pipe(source: Rc<EventEmitter>, destination: Rc<EventEmitter
         while let Some(chunk) = read_chunk(&source, None) {
             purust_emitter_emit(&source, "data", vec![chunk.clone()]);
             let bytes = chunk_bytes(&chunk);
-            {
+            let deferred = {
                 let state = state_of(&destination);
                 let mut state = state.lock().unwrap();
-                flush(&mut state, &bytes);
-            }
+                flush(&mut state, &bytes)
+            };
+            run_deferred_flush(deferred);
             purust_emitter_emit(&destination, "drain", Vec::new());
         }
         finish_writable(&destination);
@@ -492,13 +505,17 @@ pub fn Node_Stream_readSizeImpl() -> crate::UnknownType {
 }
 
 fn write_value(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
-    let state = state_of(stream);
-    let mut state = state.lock().unwrap();
-    if state.corked {
-        state.corked_bytes.extend_from_slice(&bytes);
-    } else {
-        flush(&mut state, &bytes);
-    }
+    let deferred = {
+        let state = state_of(stream);
+        let mut state = state.lock().unwrap();
+        if state.corked {
+            state.corked_bytes.extend_from_slice(&bytes);
+            None
+        } else {
+            flush(&mut state, &bytes)
+        }
+    };
+    run_deferred_flush(deferred);
 }
 
 pub fn Node_Stream_writeImpl() -> crate::UnknownType {
@@ -578,11 +595,12 @@ pub fn Node_Stream_uncorkImpl() -> crate::UnknownType {
             state.corked = false;
             std::mem::take(&mut state.corked_bytes)
         };
-        {
+        let deferred = {
             let state = state_of(&stream);
             let mut state = state.lock().unwrap();
-            flush(&mut state, &pending);
-        }
+            flush(&mut state, &pending)
+        };
+        run_deferred_flush(deferred);
         crate::Value::Unit
     })))
 }
@@ -748,11 +766,12 @@ pub fn Node_Stream_pipelineImpl() -> crate::UnknownType {
                         state.cursor = state.source.len();
                         remaining
                     };
-                    {
+                    let deferred = {
                         let state = state_of(&pair[1]);
                         let mut state = state.lock().unwrap();
-                        flush(&mut state, &bytes);
-                    }
+                        flush(&mut state, &bytes)
+                    };
+                    run_deferred_flush(deferred);
                     state_of(&pair[0]).lock().unwrap().end_emitted = true;
                     state_of(&pair[1]).lock().unwrap().end_emitted = true;
                 }
