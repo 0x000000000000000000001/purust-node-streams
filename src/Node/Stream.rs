@@ -26,6 +26,7 @@ struct StreamState {
     readable_high_water_mark: i64,
     // Writable side
     destination: Option<String>,
+    write_fd: Option<i32>,
     sink: Vec<u8>,
     corked: bool,
     corked_bytes: Vec<u8>,
@@ -50,6 +51,7 @@ fn state_new(readable: bool, writable: bool) -> Rc<Mutex<StreamState>> {
         end_emitted: false,
         readable_high_water_mark: 65536,
         destination: None,
+        write_fd: None,
         sink: Vec::new(),
         corked: false,
         corked_bytes: Vec::new(),
@@ -83,6 +85,48 @@ fn unbox_stream(value: &crate::UnknownType) -> Rc<EventEmitter> {
 
 pub fn purust_stream_box(stream: Rc<EventEmitter>) -> crate::UnknownType {
     crate::Value::Class(Rc::new(stream))
+}
+
+/// All bytes accumulated on a readable stream so far.
+pub fn purust_stream_bytes(stream: &Rc<EventEmitter>) -> Vec<u8> {
+    state_of(stream).lock().unwrap().source.clone()
+}
+
+/// Writes from this stream reach a raw file descriptor (child process stdin).
+pub fn purust_stream_set_write_fd(stream: &Rc<EventEmitter>, fd: i32) {
+    state_of(stream).lock().unwrap().write_fd = Some(fd);
+}
+
+/// Appends data to a readable stream and notifies `data` listeners.
+pub fn purust_stream_push(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
+    {
+        let state = state_of(stream);
+        let mut state = state.lock().unwrap();
+        state.source.extend_from_slice(&bytes);
+    }
+    if Purs_Node_EventEmitter::purust_emitter_listener_count(stream, "data") > 0 {
+        let chunk = crate::Value::Class(Rc::new(
+            Purs_Node_Buffer_Immutable::purust_buffer_from_bytes(bytes),
+        ));
+        purust_emitter_emit(stream, "data", vec![chunk]);
+    }
+}
+
+/// Signals the end of a readable stream (child process stdout/stderr EOF).
+pub fn purust_stream_end(stream: &Rc<EventEmitter>) {
+    let should_emit = {
+        let state = state_of(stream);
+        let mut state = state.lock().unwrap();
+        if state.end_emitted {
+            false
+        } else {
+            state.end_emitted = true;
+            true
+        }
+    };
+    if should_emit {
+        purust_emitter_emit(stream, "end", Vec::new());
+    }
 }
 
 pub fn purust_readable_from_bytes(bytes: Vec<u8>) -> Rc<EventEmitter> {
@@ -121,6 +165,22 @@ pub fn purust_writable_bytes(stream: &Rc<EventEmitter>) -> Vec<u8> {
 
 fn flush(state: &mut StreamState, bytes: &[u8]) {
     state.sink.extend_from_slice(bytes);
+    if let Some(fd) = state.write_fd {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let count = unsafe {
+                libc::write(
+                    fd,
+                    bytes[written..].as_ptr() as *const libc::c_void,
+                    bytes.len() - written,
+                )
+            };
+            if count <= 0 {
+                break;
+            }
+            written += count as usize;
+        }
+    }
     if let Some(path) = state.destination.clone() {
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
