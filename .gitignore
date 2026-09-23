@@ -7,3 +7,5 @@
 output/
 output.bak/
 package-lock.json
+
+.purmeta/

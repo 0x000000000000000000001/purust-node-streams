@@ -163,16 +163,21 @@ pub fn purust_stream_set_write_fd(stream: &Rc<EventEmitter>, fd: i32) {
 
 /// Appends data to a readable stream and notifies `data` listeners.
 pub fn purust_stream_push(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
+    let has_data = Purs_Node_EventEmitter::purust_emitter_listener_count(stream, "data") > 0;
+    let has_readable = Purs_Node_EventEmitter::purust_emitter_listener_count(stream, "readable") > 0;
     {
         let state = state_of(stream);
         let mut state = state.lock().unwrap();
         state.source.extend_from_slice(&bytes);
     }
-    if Purs_Node_EventEmitter::purust_emitter_listener_count(stream, "data") > 0 {
+    if has_data {
         let chunk = crate::Value::Class(Rc::new(
             Purs_Node_Buffer_Immutable::purust_buffer_from_bytes(bytes),
         ));
         purust_emitter_emit(stream, "data", vec![chunk]);
+    }
+    if has_readable {
+        purust_emitter_emit(stream, "readable", Vec::new());
     }
 }
 
@@ -336,21 +341,33 @@ fn defer(job: impl FnOnce() + 'static) {
 /// Copies the remaining readable bytes into the destination, then ends it and
 /// emits `end` on the source, like `Readable.pipe`.
 pub fn purust_stream_pipe(source: Rc<EventEmitter>, destination: Rc<EventEmitter>) {
-    defer(move || {
-        while let Some(chunk) = read_chunk(&source, None) {
-            purust_emitter_emit(&source, "data", vec![chunk.clone()]);
-            let bytes = chunk_bytes(&chunk);
-            let deferred = {
-                let state = state_of(&destination);
-                let mut state = state.lock().unwrap();
-                flush(&mut state, &bytes)
-            };
-            run_deferred_flush(deferred);
-            purust_emitter_emit(&destination, "drain", Vec::new());
-        }
-        finish_writable(&destination);
-        purust_emitter_emit(&source, "end", Vec::new());
-    });
+    // Flowing pipe: every chunk written or pushed on the source is forwarded
+    // to the destination, and the destination ends with the source. The old
+    // one-shot copy missed everything written after `pipe` returned.
+    let destination_for_data = destination.clone();
+    let data_callback = crate::Value::Func1(purust_core::Func1::Shared(Rc::new(move |chunk| {
+        let _ = write_value(&destination_for_data, chunk_bytes(&chunk));
+        purust_emitter_emit(&destination_for_data, "drain", Vec::new());
+        crate::Value::Unit
+    })));
+    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "data", data_callback);
+    let destination_for_end = destination.clone();
+    let end_callback = crate::Value::Func1(purust_core::Func1::Shared(Rc::new(move |_| {
+        finish_writable(&destination_for_end);
+        crate::Value::Unit
+    })));
+    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "end", end_callback);
+    let destination_for_error = destination.clone();
+    let error_callback = crate::Value::Func1(purust_core::Func1::Shared(Rc::new(move |error| {
+        purust_emitter_emit(&destination_for_error, "error", vec![error]);
+        crate::Value::Unit
+    })));
+    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "error", error_callback);
+
+    // Anything the source buffered before the pipe started flows now.
+    while let Some(chunk) = read_chunk(&source, None) {
+        purust_emitter_emit(&source, "data", vec![chunk]);
+    }
 }
 
 pub fn Node_Stream_setEncodingImpl() -> crate::UnknownType {
@@ -497,10 +514,46 @@ pub fn Node_Stream_readImpl() -> crate::UnknownType {
         let stream = unbox_stream(&value);
         match read_chunk(&stream, None) {
             Some(chunk) => crate::Value::Class(Rc::new(
-                Purs_Data_Nullable::Data_Nullable_notNull(chunk),
+                // `Chunk` is a foreign carrier: the generated parser unwraps the
+                // nullable payload as `Rc<Chunk>` before classifying it.
+                Purs_Data_Nullable::Data_Nullable_notNull(crate::Value::Class(Rc::new(Rc::new(
+                    chunk,
+                )))),
             )),
             None => crate::Value::Class(Rc::new(Purs_Data_Nullable::Data_Nullable_null())),
         }
+    })))
+}
+
+/// `Nullable Buffer` readers: the payload is the native Buffer value, so no
+/// `Chunk` classification is needed at the call site.
+fn nullable_buffer(chunk: Option<crate::UnknownType>) -> crate::UnknownType {
+    crate::Value::Class(Rc::new(match chunk {
+        Some(chunk) => Purs_Data_Nullable::Data_Nullable_notNull(chunk),
+        None => Purs_Data_Nullable::Data_Nullable_null(),
+    }))
+}
+
+fn read_buffer(value: &crate::UnknownType, size: Option<usize>) -> crate::UnknownType {
+    let stream = unbox_stream(value);
+    match read_chunk(&stream, size) {
+        Some(chunk) => match chunk.resolve() {
+            crate::Value::String(_) => panic!("Stream encoding should not be set"),
+            _ => nullable_buffer(Some(chunk)),
+        },
+        None => nullable_buffer(None),
+    }
+}
+
+pub fn Node_Stream_readBufferImpl() -> crate::UnknownType {
+    crate::Value::Func1(purust_core::Func1::Shared(Rc::new(|value| {
+        read_buffer(&value, None)
+    })))
+}
+
+pub fn Node_Stream_readBufferSizeImpl() -> crate::UnknownType {
+    crate::Value::Func2(purust_core::Func2::Shared(Rc::new(|value, size| {
+        read_buffer(&value, Some(size.unwrap_int().max(1) as usize))
     })))
 }
 
@@ -510,14 +563,35 @@ pub fn Node_Stream_readSizeImpl() -> crate::UnknownType {
         let size = size.unwrap_int().max(1) as usize;
         match read_chunk(&stream, Some(size)) {
             Some(chunk) => crate::Value::Class(Rc::new(
-                Purs_Data_Nullable::Data_Nullable_notNull(chunk),
+                Purs_Data_Nullable::Data_Nullable_notNull(crate::Value::Class(Rc::new(Rc::new(
+                    chunk,
+                )))),
             )),
             None => crate::Value::Class(Rc::new(Purs_Data_Nullable::Data_Nullable_null())),
         }
     })))
 }
 
-fn write_value(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
+/// Returns the error that rejected the write, like Node's write-after-end and
+/// writes to a destroyed stream.
+fn write_value(stream: &Rc<EventEmitter>, bytes: Vec<u8>) -> Option<crate::UnknownType> {
+    {
+        let state = state_of(stream);
+        let state = state.lock().unwrap();
+        if let Some(error) = &state.error {
+            return Some(error.clone());
+        }
+        if state.destroyed {
+            return Some(Purs_Effect_Exception::Effect_Exception_error(
+                purust_core::purust_string_from_utf8("Cannot call write after a stream was destroyed"),
+            ));
+        }
+        if state.finished {
+            return Some(Purs_Effect_Exception::Effect_Exception_error(
+                purust_core::purust_string_from_utf8("write after end"),
+            ));
+        }
+    }
     let deferred = {
         let state = state_of(stream);
         let mut state = state.lock().unwrap();
@@ -529,6 +603,19 @@ fn write_value(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
         }
     };
     run_deferred_flush(deferred);
+    None
+}
+
+fn nullable_error(error: Option<crate::UnknownType>) -> crate::UnknownType {
+    crate::Value::Class(Rc::new(match error {
+        Some(error) => Purs_Data_Nullable::Data_Nullable_notNull(error),
+        None => Purs_Data_Nullable::Data_Nullable_null(),
+    }))
+}
+
+fn reject_write(stream: &Rc<EventEmitter>, error: crate::UnknownType) -> crate::UnknownType {
+    purust_emitter_emit(stream, "error", vec![error.clone()]);
+    error
 }
 
 pub fn Node_Stream_writeImpl() -> crate::UnknownType {
@@ -537,8 +624,13 @@ pub fn Node_Stream_writeImpl() -> crate::UnknownType {
         let bytes = buffer
             .unwrap_class::<Rc<Purs_Node_Buffer_Immutable::ImmutableBuffer>>()
             .bytes();
-        write_value(&stream, bytes);
-        crate::mk_bool(true)
+        match write_value(&stream, bytes) {
+            None => crate::mk_bool(true),
+            Some(error) => {
+                let _ = reject_write(&stream, error);
+                crate::mk_bool(false)
+            }
+        }
     })))
 }
 
@@ -549,11 +641,17 @@ pub fn Node_Stream_writeCbImpl() -> crate::UnknownType {
             let bytes = buffer
                 .unwrap_class::<Rc<Purs_Node_Buffer_Immutable::ImmutableBuffer>>()
                 .bytes();
-            write_value(&stream, bytes);
-            callback.unwrap_func1()(crate::Value::Class(Rc::new(
-                Purs_Data_Nullable::Data_Nullable_null(),
-            )));
-            crate::mk_bool(true)
+            match write_value(&stream, bytes) {
+                None => {
+                    callback.unwrap_func1()(nullable_error(None));
+                    crate::mk_bool(true)
+                }
+                Some(error) => {
+                    let error = reject_write(&stream, error);
+                    callback.unwrap_func1()(nullable_error(Some(error)));
+                    crate::mk_bool(false)
+                }
+            }
         },
     )))
 }
@@ -562,8 +660,13 @@ pub fn Node_Stream_writeStringImpl() -> crate::UnknownType {
     crate::Value::Func3(purust_core::Func3::Shared(Rc::new(
         |value, text, encoding| {
             let stream = unbox_stream(&value);
-            write_value(&stream, encode_string(&text.unwrap_string(), &encoding));
-            crate::mk_bool(true)
+            match write_value(&stream, encode_string(&text.unwrap_string(), &encoding)) {
+                None => crate::mk_bool(true),
+                Some(error) => {
+                    let _ = reject_write(&stream, error);
+                    crate::mk_bool(false)
+                }
+            }
         },
     )))
 }
@@ -572,11 +675,17 @@ pub fn Node_Stream_writeStringCbImpl() -> crate::UnknownType {
     crate::Value::Func4(purust_core::Func4::Shared(Rc::new(
         |value, text, encoding, callback| {
             let stream = unbox_stream(&value);
-            write_value(&stream, encode_string(&text.unwrap_string(), &encoding));
-            callback.unwrap_func1()(crate::Value::Class(Rc::new(
-                Purs_Data_Nullable::Data_Nullable_null(),
-            )));
-            crate::mk_bool(true)
+            match write_value(&stream, encode_string(&text.unwrap_string(), &encoding)) {
+                None => {
+                    callback.unwrap_func1()(nullable_error(None));
+                    crate::mk_bool(true)
+                }
+                Some(error) => {
+                    let error = reject_write(&stream, error);
+                    callback.unwrap_func1()(nullable_error(Some(error)));
+                    crate::mk_bool(false)
+                }
+            }
         },
     )))
 }
@@ -629,10 +738,16 @@ pub fn Node_Stream_setDefaultEncodingImpl() -> crate::UnknownType {
 pub fn Node_Stream_endCbImpl() -> crate::UnknownType {
     crate::Value::Func2(purust_core::Func2::Shared(Rc::new(|value, callback| {
         let stream = unbox_stream(&value);
-        finish_writable(&stream);
-        callback.unwrap_func1()(crate::Value::Class(Rc::new(
-            Purs_Data_Nullable::Data_Nullable_null(),
-        )));
+        let error = state_of(&stream).lock().unwrap().error.clone();
+        match error {
+            Some(error) => {
+                callback.unwrap_func1()(nullable_error(Some(error)));
+            }
+            None => {
+                finish_writable(&stream);
+                callback.unwrap_func1()(nullable_error(None));
+            }
+        }
         crate::Value::Unit
     })))
 }
@@ -816,6 +931,30 @@ pub fn Node_Stream_readableFromBufImpl() -> crate::UnknownType {
 
 pub fn Node_Stream_newPassThrough() -> crate::UnknownType {
     crate::Value::Func1(purust_core::Func1::Static(|_| {
-        purust_stream_box(stream_new(true, true))
+        purust_stream_box(new_pass_through())
     }))
+}
+
+/// A duplex that echoes writes to its readable side, like Node's PassThrough.
+fn new_pass_through() -> Rc<EventEmitter> {
+    let stream = stream_new(true, true);
+    let weak_for_write = Rc::downgrade(&stream);
+    purust_stream_set_write_hook(
+        &stream,
+        std::sync::Arc::new(move |bytes| {
+            if let Some(target) = weak_for_write.upgrade() {
+                purust_stream_push(&target, bytes.to_vec());
+            }
+        }),
+    );
+    let weak_for_end = Rc::downgrade(&stream);
+    purust_stream_set_end_hook(
+        &stream,
+        std::sync::Arc::new(move || {
+            if let Some(target) = weak_for_end.upgrade() {
+                purust_stream_end(&target);
+            }
+        }),
+    );
+    stream
 }

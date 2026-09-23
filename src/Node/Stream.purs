@@ -167,31 +167,17 @@ dataHEither = EventHandle "data" \cb ->
 
 -- | Note: this will fail if `setEncoding` has been called on the stream.
 read :: forall w. Readable w -> Effect (Maybe Buffer)
-read r = do
-  chunk <- runEffectFn1 readImpl r
-  case toMaybe chunk of
-    Nothing ->
-      pure Nothing
-    Just c ->
-      runEffectFn3 readChunkImpl
-        (mkEffectFn1 \buf -> pure $ Just buf)
-        (mkEffectFn1 \_ -> throw "Stream encoding should not be set")
-        c
+read r = toMaybe <$> runEffectFn1 readBufferImpl r
+
+foreign import readBufferImpl :: forall w. EffectFn1 (Readable w) (Nullable Buffer)
 
 foreign import readImpl :: forall w. EffectFn1 (Readable w) (Nullable Chunk)
 
 -- | Note: this will fail if `setEncoding` has been called on the stream.
 read' :: forall w. Readable w -> Int -> Effect (Maybe Buffer)
-read' r size = do
-  chunk <- runEffectFn2 readSizeImpl r size
-  case toMaybe chunk of
-    Nothing ->
-      pure Nothing
-    Just c ->
-      runEffectFn3 readChunkImpl
-        (mkEffectFn1 \buf -> pure $ Just buf)
-        (mkEffectFn1 \_ -> throw "Stream encoding should not be set")
-        c
+read' r size = toMaybe <$> runEffectFn2 readBufferSizeImpl r size
+
+foreign import readBufferSizeImpl :: forall w. EffectFn2 (Readable w) (Int) (Nullable Buffer)
 
 foreign import readSizeImpl :: forall w. EffectFn2 (Readable w) (Int) (Nullable Chunk)
 
