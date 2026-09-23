@@ -116,6 +116,19 @@ pub fn purust_stream_clear(stream: &Rc<EventEmitter>) {
     state.cursor = 0;
 }
 
+/// Atomically drains the unconsumed readable bytes. Native integrations whose
+/// listeners attach after the first bytes arrived replay them through this,
+/// like Node resumes a paused stream.
+pub fn purust_stream_take(stream: &Rc<EventEmitter>) -> Vec<u8> {
+    let state = state_of(stream);
+    let mut state = state.lock().unwrap();
+    let consumed = state.cursor.min(state.source.len());
+    let bytes = state.source.split_off(consumed);
+    state.source.clear();
+    state.cursor = 0;
+    bytes
+}
+
 pub fn purust_stream_set_extension(stream: &Rc<EventEmitter>, value: crate::UnknownType) {
     state_of(stream).lock().unwrap().extension = Some(value);
 }
