@@ -37,6 +37,13 @@ struct StreamState {
     closed: bool,
     allow_half_open: bool,
     error: Option<crate::UnknownType>,
+    /// Native integrations (sockets, child processes) attach their own state.
+    extension: Option<crate::UnknownType>,
+    /// Called when the writable side ends, so integrations can shut down fds.
+    end_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// When set, writes are handed to this hook instead of the fd/file sink
+    /// (HTTP layers flush their head before the first body write).
+    write_hook: Option<std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>>,
 }
 
 fn state_new(readable: bool, writable: bool) -> Rc<Mutex<StreamState>> {
@@ -62,6 +69,9 @@ fn state_new(readable: bool, writable: bool) -> Rc<Mutex<StreamState>> {
         closed: false,
         allow_half_open: false,
         error: None,
+        extension: None,
+        end_hook: None,
+        write_hook: None,
     }))
 }
 
@@ -85,6 +95,47 @@ fn unbox_stream(value: &crate::UnknownType) -> Rc<EventEmitter> {
 
 pub fn purust_stream_box(stream: Rc<EventEmitter>) -> crate::UnknownType {
     crate::Value::Class(Rc::new(stream))
+}
+
+/// A duplex stream: readable and writable.
+pub fn purust_stream_duplex() -> Rc<EventEmitter> {
+    stream_new(true, true)
+}
+
+/// A stream with the requested directions.
+pub fn purust_stream_new_stream(readable: bool, writable: bool) -> Rc<EventEmitter> {
+    stream_new(readable, writable)
+}
+
+/// Drops the bytes accumulated so far on a readable stream (used after they
+/// have been flushed to a descriptor).
+pub fn purust_stream_clear(stream: &Rc<EventEmitter>) {
+    let state = state_of(stream);
+    let mut state = state.lock().unwrap();
+    state.source.clear();
+    state.cursor = 0;
+}
+
+pub fn purust_stream_set_extension(stream: &Rc<EventEmitter>, value: crate::UnknownType) {
+    state_of(stream).lock().unwrap().extension = Some(value);
+}
+
+pub fn purust_stream_extension(stream: &Rc<EventEmitter>) -> Option<crate::UnknownType> {
+    state_of(stream).lock().unwrap().extension.clone()
+}
+
+pub fn purust_stream_set_write_hook(
+    stream: &Rc<EventEmitter>,
+    hook: std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>,
+) {
+    state_of(stream).lock().unwrap().write_hook = Some(hook);
+}
+
+pub fn purust_stream_set_end_hook(
+    stream: &Rc<EventEmitter>,
+    hook: std::sync::Arc<dyn Fn() + Send + Sync>,
+) {
+    state_of(stream).lock().unwrap().end_hook = Some(hook);
 }
 
 /// All bytes accumulated on a readable stream so far.
@@ -164,6 +215,10 @@ pub fn purust_writable_bytes(stream: &Rc<EventEmitter>) -> Vec<u8> {
 }
 
 fn flush(state: &mut StreamState, bytes: &[u8]) {
+    if let Some(hook) = state.write_hook.clone() {
+        hook(bytes);
+        return;
+    }
     state.sink.extend_from_slice(bytes);
     if let Some(fd) = state.write_fd {
         let mut written = 0usize;
@@ -240,8 +295,12 @@ fn finish_writable(stream: &Rc<EventEmitter>) {
         }
     };
     if should_emit {
+        let hook = state_of(stream).lock().unwrap().end_hook.clone();
         state_of(stream).lock().unwrap().finish_emitted = true;
         purust_emitter_emit(stream, "finish", Vec::new());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
