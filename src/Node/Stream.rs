@@ -21,6 +21,10 @@ struct StreamState {
     cursor: usize,
     encoding: Option<String>,
     flowing: bool,
+    /// Created from a complete in-memory buffer (fs.readFile-style readers).
+    static_source: bool,
+    /// Whether a producer pushed into this readable after it was created.
+    pushed: bool,
     paused: bool,
     end_emitted: bool,
     readable_high_water_mark: i64,
@@ -54,6 +58,8 @@ fn state_new(readable: bool, writable: bool) -> Rc<Mutex<StreamState>> {
         cursor: 0,
         encoding: None,
         flowing: false,
+        static_source: false,
+        pushed: false,
         paused: false,
         end_emitted: false,
         readable_high_water_mark: 65536,
@@ -169,6 +175,7 @@ pub fn purust_stream_push(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
         let state = state_of(stream);
         let mut state = state.lock().unwrap();
         state.source.extend_from_slice(&bytes);
+        state.pushed = true;
     }
     if has_data {
         let chunk = crate::Value::Class(Rc::new(
@@ -200,7 +207,12 @@ pub fn purust_stream_end(stream: &Rc<EventEmitter>) {
 
 pub fn purust_readable_from_bytes(bytes: Vec<u8>) -> Rc<EventEmitter> {
     let stream = stream_new(true, false);
-    state_of(&stream).lock().unwrap().source = bytes;
+    {
+        let state = state_of(&stream);
+        let mut state = state.lock().unwrap();
+        state.source = bytes;
+        state.static_source = true;
+    }
     stream
 }
 
@@ -340,10 +352,21 @@ fn defer(job: impl FnOnce() + 'static) {
 
 /// Copies the remaining readable bytes into the destination, then ends it and
 /// emits `end` on the source, like `Readable.pipe`.
+fn stream_end_emitted(stream: &Rc<EventEmitter>) -> bool {
+    state_of(stream).lock().unwrap().end_emitted
+}
+
+/// A complete buffered source (`readableFromBuf`) has no producer that could
+/// end it later, so `pipe` replays its `end` once the buffer is drained.
+fn stream_is_complete_buffer(stream: &Rc<EventEmitter>) -> bool {
+    let state = state_of(stream);
+    let state = state.lock().unwrap();
+    state.static_source && !state.pushed
+}
+
 pub fn purust_stream_pipe(source: Rc<EventEmitter>, destination: Rc<EventEmitter>) {
     // Flowing pipe: every chunk written or pushed on the source is forwarded
-    // to the destination, and the destination ends with the source. The old
-    // one-shot copy missed everything written after `pipe` returned.
+    // to the destination, and the destination ends with the source.
     let destination_for_data = destination.clone();
     let data_callback = crate::Value::Func1(purust_core::Func1::Shared(Rc::new(move |chunk| {
         let _ = write_value(&destination_for_data, chunk_bytes(&chunk));
@@ -364,10 +387,19 @@ pub fn purust_stream_pipe(source: Rc<EventEmitter>, destination: Rc<EventEmitter
     })));
     Purs_Node_EventEmitter::purust_emitter_on_native(&source, "error", error_callback);
 
-    // Anything the source buffered before the pipe started flows now.
-    while let Some(chunk) = read_chunk(&source, None) {
-        purust_emitter_emit(&source, "data", vec![chunk]);
-    }
+    // Anything the source buffered before the pipe started flows in a
+    // deferred job, so listeners registered right after `pipe` still see it.
+    defer(move || {
+        while let Some(chunk) = read_chunk(&source, None) {
+            purust_emitter_emit(&source, "data", vec![chunk]);
+        }
+        // A source that already ended - or a complete in-memory buffer that
+        // was just drained - still notifies late listeners.
+        if stream_end_emitted(&source) || stream_is_complete_buffer(&source) {
+            finish_writable(&destination);
+            purust_emitter_emit(&source, "end", Vec::new());
+        }
+    });
 }
 
 pub fn Node_Stream_setEncodingImpl() -> crate::UnknownType {
