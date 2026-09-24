@@ -1,8 +1,13 @@
 -- | How to test:
 -- |
 -- | ```
--- | pulp test --main Test.Main2
+-- | spago test --main Test.Main2
 -- | ```
+-- |
+-- | Writes many chunks through a `PassThrough` and reads them back. The
+-- | original suite compared `expected == expected`, so its check could never
+-- | fail; the port counts the actual lines and exits with a non-zero status so
+-- | the runner can rely on the process status.
 module Test.Main2 where
 
 import Prelude
@@ -17,24 +22,29 @@ import Effect.Class (liftEffect)
 import Effect.Class.Console as Console
 import Node.Buffer as Buffer
 import Node.Encoding (Encoding(..))
+import Node.Process (exit')
 import Node.Stream (newPassThrough)
-import Node.Stream.Aff (readableToStringUtf8, write)
-import Unsafe.Coerce (unsafeCoerce)
+import Node.Stream.Aff (end, readableToStringUtf8, write)
 
 completion :: Either Error Unit -> Effect Unit
 completion = case _ of
-  Left e -> Console.error (unsafeCoerce e)
-  Right _ -> mempty
+  Left e -> do
+    Console.error (show e)
+    exit' 1
+  Right _ -> do
+    Console.log "Tests passed"
+    exit' 0
 
 main :: Effect Unit
 main = do
   duplex <- newPassThrough
   runAff_ completion do
     let expected = 100_000
-    b <- liftEffect $ Buffer.fromString "aaaaaaaaaa" UTF8
-    write duplex $ Array.replicate 100000 b
+    -- One newline per chunk, so the number of lines is observable.
+    b <- liftEffect $ Buffer.fromString "aaaaaaaaaa\n" UTF8
+    write duplex $ Array.replicate expected b
+    end duplex
     str <- readableToStringUtf8 duplex
-    let actual = Array.length (String.split (Pattern "\n") str)
-    unless (expected == expected) do
+    let actual = Array.length (String.split (Pattern "\n") str) - 1
+    unless (actual == expected) do
       throwError $ error $ "Expected " <> show expected <> " lines, but got " <> show actual <> " lines."
-

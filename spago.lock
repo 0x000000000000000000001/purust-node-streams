@@ -53,6 +53,10 @@
           "dependencies": [
             "assert",
             "console",
+            "either",
+            "exceptions",
+            "node-buffer",
+            "node-process",
             "partial",
             "spec"
           ]
@@ -1123,6 +1127,24 @@
         "transformers"
       ]
     },
+    "foreign-object": {
+      "type": "local",
+      "path": "../purust-foreign-object",
+      "dependencies": [
+        "arrays",
+        "foldable-traversable",
+        "functions",
+        "gen",
+        "lists",
+        "maybe",
+        "prelude",
+        "st",
+        "tailrec",
+        "tuples",
+        "typelevel-prelude",
+        "unfoldable"
+      ]
+    },
     "fork": {
       "type": "registry",
       "version": "6.0.0",
@@ -1317,6 +1339,21 @@
         "unsafe-coerce"
       ]
     },
+    "node-process": {
+      "type": "local",
+      "path": "../purust-node-process",
+      "dependencies": [
+        "effect",
+        "foreign",
+        "foreign-object",
+        "maybe",
+        "node-event-emitter",
+        "node-streams",
+        "posix-types",
+        "prelude",
+        "unsafe-coerce"
+      ]
+    },
     "nonempty": {
       "type": "registry",
       "version": "7.0.0",
@@ -1430,6 +1467,16 @@
         "tailrec",
         "transformers",
         "tuples"
+      ]
+    },
+    "posix-types": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-Je5jG439F/SFO/IvVevZnWVxDIonrehlKuJkefP2lHE=",
+      "dependencies": [
+        "maybe",
+        "newtype",
+        "prelude"
       ]
     },
     "prelude": {
@@ -1586,6 +1633,15 @@
       "version": "4.0.1",
       "integrity": "sha256-BBqYOSnAKmayRvR5mtZoCf4SlYs2ipatD/+5nQx73aw=",
       "dependencies": []
+    },
+    "typelevel-prelude": {
+      "type": "registry",
+      "version": "7.0.0",
+      "integrity": "sha256-+pHi14/40mTj/+lmCWqL0T7iXIXD1+NSg/KItyyoB0A=",
+      "dependencies": [
+        "prelude",
+        "type-equality"
+      ]
     },
     "unfoldable": {
       "type": "local",

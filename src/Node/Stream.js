@@ -44,6 +44,13 @@ export const readImpl = (r) => r.read();
 
 export const readSizeImpl = (r, size) => r.read(size);
 
+// The native readers need explicit Buffer carriers; in JavaScript `read`
+// already returns the Buffer (or the String when an encoding is set), so
+// both declarations share the same implementation.
+export const readBufferImpl = (r) => r.read();
+
+export const readBufferSizeImpl = (r, size) => r.read(size);
+
 export const writeImpl = (w, buf) => w.write(buf);
 
 export const writeCbImpl = (w, buf, cb) => w.write(buf, cb);

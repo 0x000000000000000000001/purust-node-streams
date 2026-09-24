@@ -167,20 +167,34 @@ pub fn purust_stream_set_write_fd(stream: &Rc<EventEmitter>, fd: i32) {
     state_of(stream).lock().unwrap().write_fd = Some(fd);
 }
 
-/// Appends data to a readable stream and notifies `data` listeners.
+/// Appends data to a readable stream and notifies `data` listeners. After
+/// `setEncoding`, Node delivers decoded strings to `data` listeners, so the
+/// emitted chunk follows the stream encoding.
 pub fn purust_stream_push(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
     let has_data = Purs_Node_EventEmitter::purust_emitter_listener_count(stream, "data") > 0;
     let has_readable = Purs_Node_EventEmitter::purust_emitter_listener_count(stream, "readable") > 0;
+    let chunk = if has_data {
+        let state = state_of(stream);
+        let state = state.lock().unwrap();
+        match state.encoding.clone() {
+            Some(encoding) => {
+                let name = Purs_Node_Encoding::purust_encoding_from_name(&encoding);
+                Some(crate::Value::String(purust_encoding_decode(name, &bytes)))
+            }
+            None => Some(crate::Value::Class(Rc::new(
+                Purs_Node_Buffer_Immutable::purust_buffer_from_bytes(bytes.clone()),
+            ))),
+        }
+    } else {
+        None
+    };
     {
         let state = state_of(stream);
         let mut state = state.lock().unwrap();
         state.source.extend_from_slice(&bytes);
         state.pushed = true;
     }
-    if has_data {
-        let chunk = crate::Value::Class(Rc::new(
-            Purs_Node_Buffer_Immutable::purust_buffer_from_bytes(bytes),
-        ));
+    if let Some(chunk) = chunk {
         purust_emitter_emit(stream, "data", vec![chunk]);
     }
     if has_readable {
@@ -410,9 +424,22 @@ pub fn Node_Stream_setEncodingImpl() -> crate::UnknownType {
     })))
 }
 
+/// `readImpl`/`readSizeImpl` wrap the chunk in a `Class` for the generated
+/// `Maybe Chunk` parser, while `dataH`/`dataHStr` hand the raw value over.
+/// Unwrap the carrier before classifying so both paths agree.
+fn unwrap_chunk_carrier(chunk: crate::UnknownType) -> crate::UnknownType {
+    if let crate::Value::Class(payload) = chunk.resolve() {
+        if let Some(inner) = payload.downcast_ref::<Rc<crate::UnknownType>>() {
+            return inner.as_ref().clone();
+        }
+    }
+    chunk
+}
+
 pub fn Node_Stream_readChunkImpl() -> crate::UnknownType {
     crate::Value::Func3(purust_core::Func3::Shared(Rc::new(
         |use_buffer, use_string, chunk| {
+            let chunk = unwrap_chunk_carrier(chunk);
             if let crate::Value::String(_) = chunk.resolve() {
                 use_string.unwrap_func1()(chunk)
             } else {
@@ -433,12 +460,13 @@ pub fn Node_Stream_readableImpl() -> crate::UnknownType {
 pub fn Node_Stream_readableEndedImpl() -> crate::UnknownType {
     crate::Value::Func1(purust_core::Func1::Shared(Rc::new(|value| {
         let stream = unbox_stream(&value);
-        let done = {
+        // Node: `readableEnded` is true once the `end` event has been emitted.
+        let (readable, ended) = {
             let state = state_of(&stream);
             let state = state.lock().unwrap();
-            state.readable && state.cursor >= state.source.len()
+            (state.readable, state.end_emitted)
         };
-        crate::mk_bool(done)
+        crate::mk_bool(readable && ended)
     })))
 }
 
@@ -546,8 +574,8 @@ pub fn Node_Stream_readImpl() -> crate::UnknownType {
         let stream = unbox_stream(&value);
         match read_chunk(&stream, None) {
             Some(chunk) => crate::Value::Class(Rc::new(
-                // `Chunk` is a foreign carrier: the generated parser unwraps the
-                // nullable payload as `Rc<Chunk>` before classifying it.
+                // The generated `Maybe Chunk` parser unwraps the nullable
+                // payload as `Rc<Chunk>`, so the chunk is class-wrapped.
                 Purs_Data_Nullable::Data_Nullable_notNull(crate::Value::Class(Rc::new(Rc::new(
                     chunk,
                 )))),

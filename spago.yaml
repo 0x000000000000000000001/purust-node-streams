@@ -33,6 +33,10 @@ package:
     dependencies:
       - assert
       - console
+      - either
+      - exceptions
+      - node-buffer
+      - node-process
       - partial
       - spec
 

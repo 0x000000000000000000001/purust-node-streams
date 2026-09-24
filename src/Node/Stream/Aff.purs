@@ -172,6 +172,25 @@ readableToBuffers r = liftAff $ makeAff \complete -> do
     void $ liftST $ Array.ST.push buf bufs
 
   Ref.write rmData dataRef
+  ended <- Stream.readableEnded r
+  if ended then do
+    -- The stream ended before these listeners attached. Node emits `end`
+    -- only after the buffered data has been consumed, so drain what is left
+    -- instead of waiting for an event that already fired.
+    untilE do
+      Stream.read r >>= case _ of
+        Nothing -> pure true
+        Just chunk -> do
+          void $ liftST $ Array.ST.push chunk bufs
+          pure false
+    removeError
+    removeClose
+    removeEnd
+    removeData
+    result <- liftST $ Array.ST.unsafeFreeze bufs
+    complete $ Right result
+  else
+    pure unit
   pure $ effectCanceler do
     removeError
     removeClose
@@ -225,8 +244,17 @@ readSome r = liftAff <<< makeAff $ \complete -> do
             pure false
 
       ret1 <- liftST $ Array.ST.unsafeFreeze bufs
+      ended <- Stream.readableEnded r
       readagain <- readable r
-      if readagain && Array.length ret1 == 0 then do
+      if ended then do
+        -- The stream ended before this call: what was drained is everything,
+        -- and no later `readable`/`end` event can arrive.
+        removeError
+        removeClose
+        removeEnd
+        complete (Right { buffers: ret1, readagain: false })
+        pure nonCanceler
+      else if readagain && Array.length ret1 == 0 then do
         -- if still readable and we couldn't read anything right away,
         -- then wait for the readable event.
         -- “The 'readable' event will also be emitted once the end of the
@@ -329,13 +357,23 @@ readAll r = liftAff <<< makeAff $ \complete -> do
             waitToRead -- this is not recursion
           Ref.write removeReadable' removeReadable
 
-      waitToRead
-      -- canceller might by called while waiting for `onceReadable`
-      pure $ effectCanceler do
+      ended <- Stream.readableEnded r
+      if ended then do
+        -- The stream ended before this call: the drained buffer is complete.
         removeError
         removeClose
         removeEnd
-        join $ Ref.read removeReadable
+        ret <- liftST $ Array.ST.unsafeFreeze bufs
+        complete (Right ret)
+        pure nonCanceler
+      else do
+        waitToRead
+        -- canceller might by called while waiting for `onceReadable`
+        pure $ effectCanceler do
+          removeError
+          removeClose
+          removeEnd
+          join $ Ref.read removeReadable
   else do
     complete (Right [])
     pure nonCanceler
@@ -416,8 +454,17 @@ readN r n = liftAff <<< makeAff $ \complete ->
             ret <- liftST $ Array.ST.unsafeFreeze bufs
             readagain <- readable r
             complete (Right { buffers: ret, readagain })
-          else
-            continuation unit
+          else do
+            ended <- Stream.readableEnded r
+            if ended then do
+              -- The stream ended with fewer than N bytes: return them.
+              removeError
+              removeClose
+              removeEnd
+              ret <- liftST $ Array.ST.unsafeFreeze bufs
+              complete (Right { buffers: ret, readagain: false })
+            else
+              continuation unit
 
         -- if there were not enough bytes right away, then wait for bytes to come in.
         waitToRead _ = do

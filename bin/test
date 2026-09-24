@@ -61,8 +61,19 @@ if [ "$status" -ne 0 ] || [ -s output/actual.stderr ]; then
   echo "[FAILED] Node.Stream tests exited with status $status" >&2
   exit 1
 fi
-if ! grep -q 'test end' output/actual.stdout; then
-  echo "[FAILED] Node.Stream tests did not reach the final group" >&2
+if ! grep -q 'Tests passed' output/actual.stdout; then
+  echo "[FAILED] Node.Stream tests did not reach the final marker" >&2
   exit 1
 fi
-echo "Summary: the native Node.Stream tests passed."
+echo "=== Running the overflow PassThrough test (Test.Main2) ==="
+"$COMPILER_DIR/bin/purust" --source output --out output/purust_output --main Test.Main2 --threaded
+cargo build --manifest-path output/purust_output/Cargo.toml
+status=0
+node -e 'const { spawnSync } = require("node:child_process"); const result = spawnSync(process.argv[1], [], { stdio: "inherit", timeout: 120000 }); if (result.error) console.error(result.error.message); process.exit(result.status ?? 1);' "$BINARY" > output/main2.stdout 2> output/main2.stderr || status=$?
+cat output/main2.stdout
+if [ "$status" -ne 0 ] || [ -s output/main2.stderr ] || ! grep -q 'Tests passed' output/main2.stdout; then
+  cat output/main2.stderr >&2
+  echo "[FAILED] Test.Main2 exited with status $status" >&2
+  exit 1
+fi
+echo "Summary: the native Node.Stream tests passed (default suite and Test.Main2)."
