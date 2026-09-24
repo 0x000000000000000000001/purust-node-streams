@@ -76,4 +76,32 @@ if [ "$status" -ne 0 ] || [ -s output/main2.stderr ] || ! grep -q 'Tests passed'
   echo "[FAILED] Test.Main2 exited with status $status" >&2
   exit 1
 fi
-echo "Summary: the native Node.Stream tests passed (default suite and Test.Main2)."
+
+# The upstream `Test.Main1`, `Test.Main3` and `Test.Main4` each have their own
+# entry point; build and run them on demand.
+run_extra_main() {
+  local main="$1" label="$2"
+  shift 2
+  echo "=== Running $label (Test.$main) ==="
+  "$COMPILER_DIR/bin/purust" --source output --out output/purust_output --main "Test.$main" --threaded
+  cargo build --manifest-path output/purust_output/Cargo.toml
+  local status=0
+  CHILD_TIMEOUT_MS=180000 node -e 'const { spawnSync } = require("node:child_process"); const result = spawnSync(process.argv[1], process.argv.slice(2), { stdio: "inherit", timeout: Number(process.env.CHILD_TIMEOUT_MS || 60000) }); if (result.error) console.error(result.error.message); process.exit(result.status ?? 1);' "$BINARY" "$@" > "output/$main.stdout" 2> "output/$main.stderr" || status=$?
+  cat "output/$main.stdout"
+  if [ "$status" -ne 0 ] || [ -s "output/$main.stderr" ]; then
+    cat "output/$main.stderr" >&2
+    echo "[FAILED] Test.$main exited with status $status" >&2
+    exit 1
+  fi
+  if ! grep -qE '[0-9]+/[0-9]+ tests? passed' "output/$main.stdout"; then
+    echo "[FAILED] Test.$main did not report a passing summary" >&2
+    exit 1
+  fi
+}
+
+run_extra_main Main1 "Aff readers, destroyed streams and file streams"
+run_extra_main Main4 "blocked readSome and the event loop"
+head -c 1000000 /dev/zero > output/zeros.bin
+run_extra_main Main3 "1 MiB file stream" "$PWD/output/zeros.bin"
+
+echo "Summary: the native Node.Stream tests passed (default suite, Test.Main1 to Test.Main4)."

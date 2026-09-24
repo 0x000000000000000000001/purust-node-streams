@@ -17,14 +17,14 @@ import Data.Either (Either(..))
 import Data.String (Pattern(..))
 import Data.String as String
 import Effect (Effect)
-import Effect.Aff (Error, error, runAff_, throwError)
+import Effect.Aff (Error, error, forkAff, joinFiber, runAff_, throwError)
 import Effect.Class (liftEffect)
 import Effect.Class.Console as Console
 import Node.Buffer as Buffer
 import Node.Encoding (Encoding(..))
 import Node.Process (exit')
 import Node.Stream (newPassThrough)
-import Node.Stream.Aff (end, readableToStringUtf8, write)
+import Node.Stream.Aff (end, readAll, write)
 
 completion :: Either Error Unit -> Effect Unit
 completion = case _ of
@@ -42,9 +42,16 @@ main = do
     let expected = 100_000
     -- One newline per chunk, so the number of lines is observable.
     b <- liftEffect $ Buffer.fromString "aaaaaaaaaa\n" UTF8
-    write duplex $ Array.replicate expected b
-    end duplex
-    str <- readableToStringUtf8 duplex
+    -- Read in paused mode *while* writing: the writer reports backpressure
+    -- and waits for `drain`, which these reads produce. (A flowing reader
+    -- never advances the buffered bytes, so it could not drain the writer.)
+    writer <- forkAff do
+      write duplex $ Array.replicate expected b
+      end duplex
+    bufs <- readAll duplex
+    joinFiber writer
+    all <- liftEffect $ Buffer.concat bufs
+    str <- liftEffect $ Buffer.toString UTF8 all
     let actual = Array.length (String.split (Pattern "\n") str) - 1
     unless (actual == expected) do
       throwError $ error $ "Expected " <> show expected <> " lines, but got " <> show actual <> " lines."

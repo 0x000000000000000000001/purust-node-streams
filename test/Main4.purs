@@ -14,16 +14,15 @@ import Control.Alt (alt)
 import Data.Either (Either(..))
 import Effect (Effect)
 import Effect.Aff (Error, Milliseconds(..), delay, parallel, runAff_, sequential)
+import Effect.Class (liftEffect)
 import Effect.Class.Console as Console
-import Node.Stream (Readable)
+import Node.Stream (newPassThrough)
 import Node.Stream.Aff (readSome)
 import Partial.Unsafe (unsafePartial)
 import Test.Spec (describe, it)
 import Test.Spec.Reporter (consoleReporter)
 import Test.Spec.Runner (runSpec)
 import Unsafe.Coerce (unsafeCoerce)
-
-foreign import stdin :: Readable ()
 
 completion :: Either Error (Effect Unit) -> Effect Unit
 completion = case _ of
@@ -36,6 +35,10 @@ main = unsafePartial $ do
     runSpec [ consoleReporter ] do
       describe "Node.Stream.Aff" do
         it "reads 1" do
+          -- The harness feeds no data on stdin; a pending PassThrough keeps
+          -- the observable contract (a readable that neither produces data
+          -- nor ends), so `readSome` stays blocked and the delay branch wins.
+          stdin <- liftEffect newPassThrough
           sequential $ alt
             do
               parallel $ void $ readSome stdin

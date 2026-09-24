@@ -33,12 +33,16 @@ package:
     dependencies:
       - assert
       - console
+      - control
       - either
       - exceptions
       - node-buffer
+      - node-fs
       - node-process
+      - parallel
       - partial
       - spec
+      - unsafe-coerce
 
 workspace:
   backend:

@@ -234,59 +234,68 @@ readSome r = liftAff <<< makeAff $ \complete -> do
         complete (Left err)
         pure nonCanceler
 
-    catchException cleanupRethrow do
-      -- try to read right away.
-      untilE do
-        Stream.read r >>= case _ of
-          Nothing -> pure true
-          Just chunk -> do
-            void $ liftST $ Array.ST.push chunk bufs
-            pure false
+    destroyedNow <- Stream.destroyed r
+    if destroyedNow then do
+      removeError
+      removeClose
+      removeEnd
+      ret <- liftST $ Array.ST.unsafeFreeze bufs
+      complete (Right { buffers: ret, readagain: false })
+      pure nonCanceler
+    else
+      catchException cleanupRethrow do
+        -- try to read right away.
+        untilE do
+          Stream.read r >>= case _ of
+            Nothing -> pure true
+            Just chunk -> do
+              void $ liftST $ Array.ST.push chunk bufs
+              pure false
 
-      ret1 <- liftST $ Array.ST.unsafeFreeze bufs
-      ended <- Stream.readableEnded r
-      readagain <- readable r
-      if ended then do
-        -- The stream ended before this call: what was drained is everything,
-        -- and no later `readable`/`end` event can arrive.
-        removeError
-        removeClose
-        removeEnd
-        complete (Right { buffers: ret1, readagain: false })
-        pure nonCanceler
-      else if readagain && Array.length ret1 == 0 then do
-        -- if still readable and we couldn't read anything right away,
-        -- then wait for the readable event.
-        -- “The 'readable' event will also be emitted once the end of the
-        -- stream data has been reached but before the 'end' event is emitted.”
-        -- if not readable then this was a zero-length Readable stream.
-        -- https://nodejs.org/api/stream.html#event-readable
-        removeReadable <- r # once readableH do
-          untilE do
-            Stream.read r >>= case _ of
-              Nothing -> pure true
-              Just chunk -> do
-                void $ liftST $ Array.ST.push chunk bufs
-                pure false
-          ret2 <- liftST $ Array.ST.unsafeFreeze bufs
+        ret1 <- liftST $ Array.ST.unsafeFreeze bufs
+        ended <- Stream.readableEnded r
+        readagain <- readable r
+        if ended then do
+          -- The stream ended before this call: what was drained is everything,
+          -- and no later `readable`/`end` event can arrive.
           removeError
           removeClose
           removeEnd
-          readagain2 <- readable r
-          complete (Right { buffers: ret2, readagain: readagain2 })
-        -- canceller might by called while waiting for `onceReadable`
-        pure $ effectCanceler do
+          complete (Right { buffers: ret1, readagain: false })
+          pure nonCanceler
+        else if readagain && Array.length ret1 == 0 then do
+          -- if still readable and we couldn't read anything right away,
+          -- then wait for the readable event.
+          -- “The 'readable' event will also be emitted once the end of the
+          -- stream data has been reached but before the 'end' event is emitted.”
+          -- if not readable then this was a zero-length Readable stream.
+          -- https://nodejs.org/api/stream.html#event-readable
+          removeReadable <- r # once readableH do
+            untilE do
+              Stream.read r >>= case _ of
+                Nothing -> pure true
+                Just chunk -> do
+                  void $ liftST $ Array.ST.push chunk bufs
+                  pure false
+            ret2 <- liftST $ Array.ST.unsafeFreeze bufs
+            removeError
+            removeClose
+            removeEnd
+            readagain2 <- readable r
+            complete (Right { buffers: ret2, readagain: readagain2 })
+          -- canceller might by called while waiting for `onceReadable`
+          pure $ effectCanceler do
+            removeError
+            removeClose
+            removeEnd
+            removeReadable
+        -- else return what we read right away
+        else do
           removeError
           removeClose
           removeEnd
-          removeReadable
-      -- else return what we read right away
-      else do
-        removeError
-        removeClose
-        removeEnd
-        complete (Right { buffers: ret1, readagain })
-        pure nonCanceler
+          complete (Right { buffers: ret1, readagain })
+          pure nonCanceler
   else do
     complete (Right { buffers: [], readagain: false })
     pure nonCanceler
@@ -334,46 +343,55 @@ readAll r = liftAff <<< makeAff $ \complete -> do
         pure nonCanceler
 
     -- try to read right away.
-    catchException cleanupRethrow do
-      untilE do
-        Stream.read r >>= case _ of
-          Nothing -> pure true
-          Just chunk -> do
-            void $ liftST $ Array.ST.push chunk bufs
-            pure false
+    destroyedNow <- Stream.destroyed r
+    if destroyedNow then do
+      removeError
+      removeClose
+      removeEnd
+      ret <- liftST $ Array.ST.unsafeFreeze bufs
+      complete (Right ret)
+      pure nonCanceler
+    else
+      catchException cleanupRethrow do
+        untilE do
+          Stream.read r >>= case _ of
+            Nothing -> pure true
+            Just chunk -> do
+              void $ liftST $ Array.ST.push chunk bufs
+              pure false
 
-      -- then wait for the stream to be readable until the stream has ended.
-      let
-        waitToRead = do
-          removeReadable' <- r # once readableH do
-            -- “The 'readable' event will also be emitted once the end of the
-            -- stream data has been reached but before the 'end' event is emitted.”
-            untilE do
-              Stream.read r >>= case _ of
-                Nothing -> pure true
-                Just chunk -> do
-                  _ <- liftST $ Array.ST.push chunk bufs
-                  pure false
-            waitToRead -- this is not recursion
-          Ref.write removeReadable' removeReadable
+        -- then wait for the stream to be readable until the stream has ended.
+        let
+          waitToRead = do
+            removeReadable' <- r # once readableH do
+              -- “The 'readable' event will also be emitted once the end of the
+              -- stream data has been reached but before the 'end' event is emitted.”
+              untilE do
+                Stream.read r >>= case _ of
+                  Nothing -> pure true
+                  Just chunk -> do
+                    _ <- liftST $ Array.ST.push chunk bufs
+                    pure false
+              waitToRead -- this is not recursion
+            Ref.write removeReadable' removeReadable
 
-      ended <- Stream.readableEnded r
-      if ended then do
-        -- The stream ended before this call: the drained buffer is complete.
-        removeError
-        removeClose
-        removeEnd
-        ret <- liftST $ Array.ST.unsafeFreeze bufs
-        complete (Right ret)
-        pure nonCanceler
-      else do
-        waitToRead
-        -- canceller might by called while waiting for `onceReadable`
-        pure $ effectCanceler do
+        ended <- Stream.readableEnded r
+        if ended then do
+          -- The stream ended before this call: the drained buffer is complete.
           removeError
           removeClose
           removeEnd
-          join $ Ref.read removeReadable
+          ret <- liftST $ Array.ST.unsafeFreeze bufs
+          complete (Right ret)
+          pure nonCanceler
+        else do
+          waitToRead
+          -- canceller might by called while waiting for `onceReadable`
+          pure $ effectCanceler do
+            removeError
+            removeClose
+            removeEnd
+            join $ Ref.read removeReadable
   else do
     complete (Right [])
     pure nonCanceler
@@ -472,15 +490,24 @@ readN r n = liftAff <<< makeAff $ \complete ->
             tryToRead waitToRead -- not recursion
           Ref.write removeReadable' removeReadable
 
-      catchException cleanupRethrow do
-        -- try to read right away.
-        tryToRead waitToRead
-        -- canceller might by called while waiting for `onceReadable`
-        pure $ effectCanceler do
-          removeError
-          removeClose
-          removeEnd
-          join $ Ref.read removeReadable
+      destroyedNow <- Stream.destroyed r
+      if destroyedNow then do
+        removeError
+        removeClose
+        removeEnd
+        ret <- liftST $ Array.ST.unsafeFreeze bufs
+        complete (Right { buffers: ret, readagain: false })
+        pure nonCanceler
+      else
+        catchException cleanupRethrow do
+          -- try to read right away.
+          tryToRead waitToRead
+          -- canceller might by called while waiting for `onceReadable`
+          pure $ effectCanceler do
+            removeError
+            removeClose
+            removeEnd
+            join $ Ref.read removeReadable
     else do
       -- If the stream is not readable should that be a fail? No.
       complete (Right { buffers: [], readagain: false })

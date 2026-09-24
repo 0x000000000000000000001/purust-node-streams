@@ -53,12 +53,16 @@
           "dependencies": [
             "assert",
             "console",
+            "control",
             "either",
             "exceptions",
             "node-buffer",
+            "node-fs",
             "node-process",
+            "parallel",
             "partial",
-            "spec"
+            "spec",
+            "unsafe-coerce"
           ]
         }
       }
@@ -1249,6 +1253,21 @@
         "prelude"
       ]
     },
+    "js-date": {
+      "type": "registry",
+      "version": "8.0.0",
+      "integrity": "sha256-DNQrp4xYc8o80jtxo0aOkUeXGi6h0Xidkk2ZQ8Y4l5Y=",
+      "dependencies": [
+        "datetime",
+        "effect",
+        "enums",
+        "foreign",
+        "functions",
+        "integers",
+        "maybe",
+        "prelude"
+      ]
+    },
     "lazy": {
       "type": "local",
       "path": "../purust-lazy",
@@ -1337,6 +1356,39 @@
         "nullable",
         "prelude",
         "unsafe-coerce"
+      ]
+    },
+    "node-fs": {
+      "type": "local",
+      "path": "../purust-node-fs",
+      "dependencies": [
+        "aff",
+        "datetime",
+        "effect",
+        "either",
+        "enums",
+        "exceptions",
+        "functions",
+        "integers",
+        "js-date",
+        "maybe",
+        "node-buffer",
+        "node-path",
+        "node-streams",
+        "nullable",
+        "partial",
+        "prelude",
+        "strings",
+        "unsafe-coerce"
+      ]
+    },
+    "node-path": {
+      "type": "local",
+      "path": "../purust-node-path",
+      "dependencies": [
+        "console",
+        "effect",
+        "prelude"
       ]
     },
     "node-process": {

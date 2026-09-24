@@ -5,6 +5,7 @@ import Prelude
 import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), fromJust, isJust, isNothing)
+import Data.String (joinWith)
 import Effect (Effect)
 import Effect.Console (log)
 import Effect.Exception (error)
@@ -12,7 +13,7 @@ import Effect.Ref as Ref
 import Node.Buffer as Buffer
 import Node.Encoding (Encoding(..))
 import Node.EventEmitter (on_)
-import Node.Stream (Duplex, dataH, dataHStr, destroy', end, end', errorH, newPassThrough, pipe, read, read', readEither, readEither', readString, readableH, setDefaultEncoding, setEncoding, writeString, writeString')
+import Node.Stream (Duplex, dataH, dataHStr, destroy', drainH, end, end', errorH, newPassThrough, pipe, read, read', readEither, readEither', readString, readableH, setDefaultEncoding, setEncoding, unpipe, writeString, writeString')
 import Partial.Unsafe (unsafePartial)
 import Test.Assert (assert, assert')
 
@@ -42,6 +43,12 @@ main = do
 
   log "test partial reads and encodings"
   testPartialReads
+
+  log "test backpressure"
+  testBackpressure
+
+  log "test unpipe"
+  testUnpipe
 
   log "Tests passed"
 
@@ -284,6 +291,38 @@ testPartialReads = do
       assertEqual 2 size
     Just (Left _) -> assert' "readEither' - expected the Buffer branch" false
     Nothing -> assert' "readEither' - expected a chunk" false
+
+-- | Writes past the high water mark report backpressure; a read that drops
+-- | the buffer below it emits `drain`.
+testBackpressure :: Effect Unit
+testBackpressure = do
+  w <- newPassThrough
+  backpressure <- writeString w UTF8 (joinWith "" (Array.replicate 70_000 "x"))
+  assert' "write over the high water mark reports backpressure" (backpressure == false)
+  drained <- Ref.new false
+  w # on_ drainH (Ref.write true drained)
+  first <- read w
+  assert (isJust first)
+  got <- Ref.read drained
+  assert' "drain fires when the buffer drops below the high water mark" got
+  rest <- read w
+  assert (isJust rest)
+
+-- | `unpipe` stops forwarding data to the destination.
+testUnpipe :: Effect Unit
+testUnpipe = do
+  source <- newPassThrough
+  destination <- newPassThrough
+  _ <- source `pipe` destination
+  received <- Ref.new ""
+  destination # on_ dataH \buf -> do
+    str <- Buffer.toString UTF8 buf
+    Ref.modify_ (_ <> str) received
+  void $ writeString source UTF8 "before"
+  unpipe source destination
+  void $ writeString source UTF8 "after"
+  got <- Ref.read received
+  assertEqual "before" got
 
 foreign import createGzip :: Effect Duplex
 

@@ -27,6 +27,8 @@ struct StreamState {
     pushed: bool,
     paused: bool,
     end_emitted: bool,
+    /// `end` requested while the readable buffer still had unconsumed bytes.
+    end_requested: bool,
     readable_high_water_mark: i64,
     // Writable side
     destination: Option<String>,
@@ -48,6 +50,15 @@ struct StreamState {
     /// When set, writes are handed to this hook instead of the fd/file sink
     /// (HTTP layers flush their head before the first body write).
     write_hook: Option<std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>>,
+    /// Registered `pipe` destinations, so `unpipe` can remove their listeners.
+    pipes: Vec<PipeRegistration>,
+}
+
+struct PipeRegistration {
+    destination: usize,
+    data: crate::UnknownType,
+    end: crate::UnknownType,
+    error: crate::UnknownType,
 }
 
 fn state_new(readable: bool, writable: bool) -> Rc<Mutex<StreamState>> {
@@ -62,6 +73,7 @@ fn state_new(readable: bool, writable: bool) -> Rc<Mutex<StreamState>> {
         pushed: false,
         paused: false,
         end_emitted: false,
+        end_requested: false,
         readable_high_water_mark: 65536,
         destination: None,
         write_fd: None,
@@ -78,6 +90,7 @@ fn state_new(readable: bool, writable: bool) -> Rc<Mutex<StreamState>> {
         extension: None,
         end_hook: None,
         write_hook: None,
+        pipes: Vec::new(),
     }))
 }
 
@@ -203,19 +216,33 @@ pub fn purust_stream_push(stream: &Rc<EventEmitter>, bytes: Vec<u8>) {
 }
 
 /// Signals the end of a readable stream (child process stdout/stderr EOF).
+/// Like Node, the `end` event waits until the buffered data has been consumed:
+/// it fires immediately when nothing is pending, or when a flowing consumer
+/// (`data` listeners) received everything as it was pushed.
 pub fn purust_stream_end(stream: &Rc<EventEmitter>) {
-    let should_emit = {
+    let has_data = Purs_Node_EventEmitter::purust_emitter_listener_count(stream, "data") > 0;
+    let (immediate, deferred) = {
         let state = state_of(stream);
         let mut state = state.lock().unwrap();
         if state.end_emitted {
-            false
+            (false, false)
         } else {
-            state.end_emitted = true;
-            true
+            state.end_requested = true;
+            if has_data || state.static_source {
+                // A flowing consumer already received every pushed chunk.
+                state.end_emitted = true;
+                (true, false)
+            } else {
+                // Node reports the end on the next tick: a paused reader can
+                // still drain the buffer before the events arrive.
+                (false, true)
+            }
         }
     };
-    if should_emit {
+    if immediate {
         purust_emitter_emit(stream, "end", Vec::new());
+    } else if deferred {
+        schedule_end(stream);
     }
 }
 
@@ -226,6 +253,10 @@ pub fn purust_readable_from_bytes(bytes: Vec<u8>) -> Rc<EventEmitter> {
         let mut state = state.lock().unwrap();
         state.source = bytes;
         state.static_source = true;
+        // A complete in-memory source has no producer: `end` is pending until
+        // the buffered bytes have been consumed (a read at EOF then reports
+        // `readable` and `end`, like Node).
+        state.end_requested = true;
     }
     stream
 }
@@ -312,28 +343,74 @@ fn chunk_bytes(chunk: &Chunk) -> Vec<u8> {
     }
 }
 
+/// Emits `readable` then `end` at the next checkpoint, once: Node reports the
+/// end of a readable on the next tick, which leaves room for a reader to drain
+/// what is left between `end` and the events.
+fn schedule_end(stream: &Rc<EventEmitter>) {
+    let stream = stream.clone();
+    defer(move || {
+        purust_emitter_emit(&stream, "readable", Vec::new());
+        let ended = {
+            let state = state_of(&stream);
+            let mut state = state.lock().unwrap();
+            if state.end_emitted {
+                false
+            } else {
+                state.end_emitted = true;
+                true
+            }
+        };
+        if ended {
+            purust_emitter_emit(&stream, "end", Vec::new());
+        }
+    });
+}
+
 fn read_chunk(stream: &Rc<EventEmitter>, limit: Option<usize>) -> Option<Chunk> {
     let state = state_of(stream);
-    let mut state = state.lock().unwrap();
-    if state.cursor >= state.source.len() {
-        return None;
-    }
-    let remaining = state.source.len() - state.cursor;
-    let size = limit
-        .unwrap_or(state.readable_high_water_mark.max(1) as usize)
-        .min(remaining)
-        .max(1);
-    let bytes = state.source[state.cursor..state.cursor + size].to_vec();
-    state.cursor += size;
-    match state.encoding.clone() {
-        Some(encoding) => {
-            let name = Purs_Node_Encoding::purust_encoding_from_name(&encoding);
-            Some(crate::Value::String(purust_encoding_decode(name, &bytes)))
+    let mut eof_pending = false;
+    let (chunk, drained, end_pending) = {
+        let mut state = state.lock().unwrap();
+        if state.cursor >= state.source.len() {
+            // A read at the end of a complete stream reports the end; Node
+            // emits `readable` at EOF, before `end`.
+            eof_pending = state.end_requested && !state.end_emitted;
+            (None, false, false)
+        } else {
+            let before = state.source.len() - state.cursor;
+            let remaining = state.source.len() - state.cursor;
+            let size = limit
+                .unwrap_or(state.readable_high_water_mark.max(1) as usize)
+                .min(remaining)
+                .max(1);
+            let bytes = state.source[state.cursor..state.cursor + size].to_vec();
+            state.cursor += size;
+            let after = state.source.len() - state.cursor;
+            let high_water_mark = state.readable_high_water_mark.max(1) as usize;
+            let chunk = match state.encoding.clone() {
+                Some(encoding) => {
+                    let name = Purs_Node_Encoding::purust_encoding_from_name(&encoding);
+                    crate::Value::String(purust_encoding_decode(name, &bytes))
+                }
+                None => crate::Value::Class(Rc::new(
+                    Purs_Node_Buffer_Immutable::purust_buffer_from_bytes(bytes),
+                )),
+            };
+            // Reading below the high water mark makes the writable side drain.
+            let drained = before > high_water_mark && after <= high_water_mark;
+            // `end` is reported by the read that finds EOF (Node emits `end`
+            // when a read returns null), not by the read that consumes the
+            // last chunk.
+            (Some(chunk), drained, false)
         }
-        None => Some(crate::Value::Class(Rc::new(
-            Purs_Node_Buffer_Immutable::purust_buffer_from_bytes(bytes),
-        ))),
+    };
+    if drained {
+        purust_emitter_emit(stream, "drain", Vec::new());
     }
+    if end_pending || eof_pending {
+        schedule_end(stream);
+    }
+    chunk
 }
 
 fn finish_writable(stream: &Rc<EventEmitter>) {
@@ -387,19 +464,30 @@ pub fn purust_stream_pipe(source: Rc<EventEmitter>, destination: Rc<EventEmitter
         purust_emitter_emit(&destination_for_data, "drain", Vec::new());
         crate::Value::Unit
     })));
-    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "data", data_callback);
+    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "data", data_callback.clone());
     let destination_for_end = destination.clone();
     let end_callback = crate::Value::Func1(purust_core::Func1::Shared(Rc::new(move |_| {
         finish_writable(&destination_for_end);
         crate::Value::Unit
     })));
-    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "end", end_callback);
+    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "end", end_callback.clone());
     let destination_for_error = destination.clone();
     let error_callback = crate::Value::Func1(purust_core::Func1::Shared(Rc::new(move |error| {
         purust_emitter_emit(&destination_for_error, "error", vec![error]);
         crate::Value::Unit
     })));
-    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "error", error_callback);
+    Purs_Node_EventEmitter::purust_emitter_on_native(&source, "error", error_callback.clone());
+    // `unpipe` removes exactly these listeners.
+    {
+        let state = state_of(&source);
+        let mut state = state.lock().unwrap();
+        state.pipes.push(PipeRegistration {
+            destination: Rc::as_ptr(&destination) as usize,
+            data: data_callback,
+            end: end_callback,
+            error: error_callback,
+        });
+    }
 
     // Anything the source buffered before the pipe started flows in a
     // deferred job, so listeners registered right after `pipe` still see it.
@@ -452,8 +540,14 @@ pub fn Node_Stream_readChunkImpl() -> crate::UnknownType {
 pub fn Node_Stream_readableImpl() -> crate::UnknownType {
     crate::Value::Func1(purust_core::Func1::Shared(Rc::new(|value| {
         let stream = unbox_stream(&value);
-        let readable = state_of(&stream).lock().unwrap().readable;
-        crate::mk_bool(readable)
+        // Node: `readable` is false once `end` has been emitted or the stream
+        // was destroyed, even though the buffered bytes remain readable.
+        let (readable, ended, destroyed) = {
+            let state = state_of(&stream);
+            let state = state.lock().unwrap();
+            (state.readable, state.end_emitted, state.destroyed)
+        };
+        crate::mk_bool(readable && !ended && !destroyed)
     })))
 }
 
@@ -561,12 +655,52 @@ pub fn Node_Stream_pipeCbImpl() -> crate::UnknownType {
     )))
 }
 
-pub fn Node_Stream_unpipeAllImpl() -> crate::UnknownType {
-    crate::Value::Func1(purust_core::Func1::Static(|_| crate::Value::Unit))
+fn remove_pipe_listeners(source: &Rc<EventEmitter>, registration: &PipeRegistration) {
+    let _ = Purs_Node_EventEmitter::purust_emitter_remove_native(source, "data", &registration.data);
+    let _ = Purs_Node_EventEmitter::purust_emitter_remove_native(source, "end", &registration.end);
+    let _ = Purs_Node_EventEmitter::purust_emitter_remove_native(source, "error", &registration.error);
 }
 
 pub fn Node_Stream_unpipeImpl() -> crate::UnknownType {
-    crate::Value::Func2(purust_core::Func2::Static(|_, _| crate::Value::Unit))
+    crate::Value::Func2(purust_core::Func2::Shared(Rc::new(|source, destination| {
+        let source = unbox_stream(&source);
+        let destination = unbox_stream(&destination);
+        let destination_ptr = Rc::as_ptr(&destination) as usize;
+        let removed = {
+            let state = state_of(&source);
+            let mut state = state.lock().unwrap();
+            let mut kept = Vec::new();
+            let mut removed = Vec::new();
+            for registration in state.pipes.drain(..) {
+                if registration.destination == destination_ptr {
+                    removed.push(registration);
+                } else {
+                    kept.push(registration);
+                }
+            }
+            state.pipes = kept;
+            removed
+        };
+        for registration in &removed {
+            remove_pipe_listeners(&source, registration);
+        }
+        crate::Value::Unit
+    })))
+}
+
+pub fn Node_Stream_unpipeAllImpl() -> crate::UnknownType {
+    crate::Value::Func1(purust_core::Func1::Shared(Rc::new(|source| {
+        let source = unbox_stream(&source);
+        let removed = {
+            let state = state_of(&source);
+            let mut state = state.lock().unwrap();
+            std::mem::take(&mut state.pipes)
+        };
+        for registration in &removed {
+            remove_pipe_listeners(&source, registration);
+        }
+        crate::Value::Unit
+    })))
 }
 
 pub fn Node_Stream_readImpl() -> crate::UnknownType {
@@ -678,6 +812,15 @@ fn reject_write(stream: &Rc<EventEmitter>, error: crate::UnknownType) -> crate::
     error
 }
 
+/// Node reports backpressure when the buffered readable side exceeds the high
+/// water mark; `drain` fires once a read brings it back under.
+fn writable_has_room(stream: &Rc<EventEmitter>) -> bool {
+    let state = state_of(stream);
+    let state = state.lock().unwrap();
+    let buffered = state.source.len().saturating_sub(state.cursor);
+    buffered <= state.readable_high_water_mark.max(1) as usize
+}
+
 pub fn Node_Stream_writeImpl() -> crate::UnknownType {
     crate::Value::Func2(purust_core::Func2::Shared(Rc::new(|value, buffer| {
         let stream = unbox_stream(&value);
@@ -685,7 +828,7 @@ pub fn Node_Stream_writeImpl() -> crate::UnknownType {
             .unwrap_class::<Rc<Purs_Node_Buffer_Immutable::ImmutableBuffer>>()
             .bytes();
         match write_value(&stream, bytes) {
-            None => crate::mk_bool(true),
+            None => crate::mk_bool(writable_has_room(&stream)),
             Some(error) => {
                 let _ = reject_write(&stream, error);
                 crate::mk_bool(false)
@@ -704,7 +847,7 @@ pub fn Node_Stream_writeCbImpl() -> crate::UnknownType {
             match write_value(&stream, bytes) {
                 None => {
                     callback.unwrap_func1()(nullable_error(None));
-                    crate::mk_bool(true)
+                    crate::mk_bool(writable_has_room(&stream))
                 }
                 Some(error) => {
                     let error = reject_write(&stream, error);
@@ -721,7 +864,7 @@ pub fn Node_Stream_writeStringImpl() -> crate::UnknownType {
         |value, text, encoding| {
             let stream = unbox_stream(&value);
             match write_value(&stream, encode_string(&text.unwrap_string(), &encoding)) {
-                None => crate::mk_bool(true),
+                None => crate::mk_bool(writable_has_room(&stream)),
                 Some(error) => {
                     let _ = reject_write(&stream, error);
                     crate::mk_bool(false)
@@ -738,7 +881,7 @@ pub fn Node_Stream_writeStringCbImpl() -> crate::UnknownType {
             match write_value(&stream, encode_string(&text.unwrap_string(), &encoding)) {
                 None => {
                     callback.unwrap_func1()(nullable_error(None));
-                    crate::mk_bool(true)
+                    crate::mk_bool(writable_has_room(&stream))
                 }
                 Some(error) => {
                     let error = reject_write(&stream, error);
@@ -885,10 +1028,14 @@ pub fn Node_Stream_writeableNeedDrainImpl() -> crate::UnknownType {
 pub fn Node_Stream_destroyImpl() -> crate::UnknownType {
     crate::Value::Func1(purust_core::Func1::Shared(Rc::new(|value| {
         let stream = unbox_stream(&value);
-        let state = state_of(&stream);
-        let mut state = state.lock().unwrap();
-        state.destroyed = true;
-        state.closed = true;
+        {
+            let state = state_of(&stream);
+            let mut state = state.lock().unwrap();
+            state.destroyed = true;
+            state.closed = true;
+        }
+        // Node emits `close` after a destroy, and pending readers complete.
+        purust_emitter_emit(&stream, "close", Vec::new());
         crate::Value::Unit
     })))
 }
@@ -904,6 +1051,7 @@ pub fn Node_Stream_destroyErrorImpl() -> crate::UnknownType {
             state.error = Some(error.clone());
         }
         purust_emitter_emit(&stream, "error", vec![error]);
+        purust_emitter_emit(&stream, "close", Vec::new());
         crate::Value::Unit
     })))
 }

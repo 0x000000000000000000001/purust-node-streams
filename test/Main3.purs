@@ -15,7 +15,8 @@ import Effect.Class (liftEffect)
 import Effect.Class.Console as Console
 import Node.Buffer (Buffer, concat)
 import Node.Buffer as Buffer
-import Node.Stream (Readable)
+import Node.FS.Stream as FS
+import Node.Process as Process
 import Node.Stream.Aff (readAll, readN, readSome)
 import Partial.Unsafe (unsafePartial)
 import Test.Spec (describe, it)
@@ -24,9 +25,8 @@ import Test.Spec.Reporter (consoleReporter)
 import Test.Spec.Runner (runSpec)
 import Unsafe.Coerce (unsafeCoerce)
 
-foreign import createReadStream :: String -> Effect (Readable ())
-foreign import argv :: Effect (Array String)
-
+-- | The upstream fixture used `fs.createReadStream` and `process.argv` from
+-- | JavaScript; the port's native modules provide the same contracts.
 completion :: Either Error (Effect Unit) -> Effect Unit
 completion = case _ of
   Left e -> Console.error (unsafeCoerce e)
@@ -38,7 +38,7 @@ main = unsafePartial $ do
     runSpec [ consoleReporter ] do
       describe "Node.Stream.Aff" do
         it "reads 1" do
-          infile <- liftEffect $ createReadStream =<< pure <<< flip Array.unsafeIndex 2 =<< argv
+          infile <- liftEffect $ FS.createReadStream =<< pure <<< flip Array.unsafeIndex 2 =<< Process.argv
           { buffers: inputs1 } <- readN infile 500000
           bytesRead1 :: Int <- liftEffect $ Array.foldM (\a b -> (a + _) <$> Buffer.size b) 0 inputs1
           shouldEqual 500000 bytesRead1
